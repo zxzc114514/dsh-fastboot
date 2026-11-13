@@ -52,11 +52,17 @@ export function applyFastbootPatches({ listPaths, readText, log = () => {} }) {
 function isAsarImmutablePath(p) {
 	return (p.includes(".asar\\\\") || p.includes(".asar/")) && !p.includes(".asar.unpacked\\\\") && !p.includes(".asar.unpacked/");
 }
+function canUseMutablePathCache(p) {
+	return bootPhaseActive || (typeof p === "string" && isAsarImmutablePath(p));
+}
 function realModuleDirectory(path) {
-	const cached = realDirCache.get(path);
-	if (cached !== void 0) return cached;
+	const useCache = canUseMutablePathCache(path);
+	if (useCache) {
+		const cached = realDirCache.get(path);
+		if (cached !== void 0) return cached;
+	}
 	const resolved = isPackagedExecutable() ? realpathSync(path) : realpathSync.native(path);
-	realDirCache.set(path, resolved);
+	if (useCache) realDirCache.set(path, resolved);
 	return resolved;
 }`,
     "dsh-app-boot realModuleDirectory cache"
@@ -150,6 +156,7 @@ function readPackageManifest(anchor) {
 `const anchorPathsCache = /* @__PURE__ */ new Map();
 const pkgDirAnchorCache = /* @__PURE__ */ new Map();
 function getAnchorSearchPaths(anchor) {
+	if (!bootPhaseActive) return createRequire(anchor).resolve.paths("dsh-anchor-probe") ?? [];
 	const dir = dirname(anchor);
 	let paths = anchorPathsCache.get(dir);
 	if (paths === void 0) {
@@ -185,9 +192,10 @@ function hasPackageManifestInSearchPath(searchPath, packageName) {
 	return pkgEnt !== void 0 && (!pkgEnt.isSymbolicLink() || existsSync(join(candidate, "package.json")));
 }
 function packageDirFromAnchor(anchor, packageName) {
-	const dir = dirname(anchor);
-	const cacheKey = dir + "\\0" + packageName;
-	if (pkgDirAnchorCache.has(cacheKey)) return pkgDirAnchorCache.get(cacheKey);
+	if (isBuiltin(packageName)) return void 0;
+	const useCache = bootPhaseActive;
+	const cacheKey = useCache ? dirname(anchor) + "\\0" + packageName : "";
+	if (useCache && pkgDirAnchorCache.has(cacheKey)) return pkgDirAnchorCache.get(cacheKey);
 	let result;
 	for (const searchPath of getAnchorSearchPaths(anchor)) {
 		if (hasPackageManifestInSearchPath(searchPath, packageName)) {
@@ -195,7 +203,7 @@ function packageDirFromAnchor(anchor, packageName) {
 			break;
 		}
 	}
-	pkgDirAnchorCache.set(cacheKey, result);
+	if (useCache) pkgDirAnchorCache.set(cacheKey, result);
 	return result;
 }`,
     "dsh-app-boot packageDirFromAnchor caches"
@@ -280,34 +288,50 @@ function loadProfileDirectory(binName, dir, installAnchor, options = {}) {
 	const layers = [];
 	const skippedBundles = [];
 	const exemptions = bundles.length === 0 ? {} : readProfileVersionExemptions(dir);
-	for (const packageName of bundles) try {
-		const packageDir = resolveBundleDir(binName, packageName, installAnchor, dir);
-		if (!isAsarImmutablePath(packageDir)) {
-			const bPkg = join(packageDir, "package.json");
-			watchers.push([bPkg, statStamp(bPkg)]);
+	for (const packageName of bundles) {
+		let packageDir;
+		try {
+			packageDir = resolveBundleDir(binName, packageName, installAnchor, dir);
+			if (!isAsarImmutablePath(packageDir)) {
+				const bPkg = join(packageDir, "package.json");
+				watchers.push([bPkg, statStamp(bPkg)]);
+			}
+			const bundleManifest = readProfileManifest(binName, packageDir);
+			const bundle = bundleManifest.dsh?.bundle;
+			if (bundle === void 0) throw new Error(\`\${binName}: profile bundle \${JSON.stringify(packageName)} declares no dsh.bundle in its package.json\`);
+			assertBundlePlatform(bundle.platforms, process.platform);
+			const issue = evaluatePluginCompatibility(bundleManifest, exemptions);
+			if (issue !== void 0 && !issue.exempted) throw new Error(pluginCompatibilityWarning(issue));
+			const patchPaths = bundlePatchPaths(packageDir, bundle);
+			if (!isAsarImmutablePath(packageDir)) {
+				for (const pp of patchPaths) watchers.push([pp, statStamp(pp)]);
+			}
+			const patches = patchPaths.flatMap((pp) => loadOverlayPatches(binName, pp));
+			layers.push({
+				packageName,
+				packageDir,
+				patchPaths,
+				patches
+			});
+		} catch (error) {
+			if (packageDir === void 0 && !isBuiltin(packageName)) {
+				const seenSkipped = /* @__PURE__ */ new Set();
+				for (const anchor of [installAnchor, manifestPath]) {
+					for (const searchPath of getAnchorSearchPaths(anchor)) {
+						if (isAsarImmutablePath(searchPath)) continue;
+						const candidatePkg = join(searchPath, packageName, "package.json");
+						const watchKey = IS_WIN32 ? candidatePkg.toLowerCase() : candidatePkg;
+						if (seenSkipped.has(watchKey)) continue;
+						seenSkipped.add(watchKey);
+						watchers.push([candidatePkg, statStamp(candidatePkg)]);
+					}
+				}
+			}
+			skippedBundles.push({
+				packageName,
+				reason: String(error)
+			});
 		}
-		const bundleManifest = readProfileManifest(binName, packageDir);
-		const bundle = bundleManifest.dsh?.bundle;
-		if (bundle === void 0) throw new Error(\`\${binName}: profile bundle \${JSON.stringify(packageName)} declares no dsh.bundle in its package.json\`);
-		assertBundlePlatform(bundle.platforms, process.platform);
-		const issue = evaluatePluginCompatibility(bundleManifest, exemptions);
-		if (issue !== void 0 && !issue.exempted) throw new Error(pluginCompatibilityWarning(issue));
-		const patchPaths = bundlePatchPaths(packageDir, bundle);
-		if (!isAsarImmutablePath(packageDir)) {
-			for (const pp of patchPaths) watchers.push([pp, statStamp(pp)]);
-		}
-		const patches = patchPaths.flatMap((pp) => loadOverlayPatches(binName, pp));
-		layers.push({
-			packageName,
-			packageDir,
-			patchPaths,
-			patches
-		});
-	} catch (error) {
-		skippedBundles.push({
-			packageName,
-			reason: String(error)
-		});
 	}
 	const patches = includeUserLayer && existsSync(patchPath) ? loadOverlayPatches(binName, patchPath) : [];
 	const result = {
@@ -580,9 +604,13 @@ function invalidateBootFsPath(target, meta = {}) {
 		}
 	}
 }
-function clearAllBootVolatileCaches() {
-	bootDirCache.clear();
-	bootExactStatCache.clear();
+// 启动阶段与解析重算共用的可变热缓存清理，确保外盘变更不跨生命周期残留
+function clearNonAsarRealDirCache() {
+	for (const k of realDirCache.keys()) {
+		if (!isAsarImmutablePath(k)) realDirCache.delete(k);
+	}
+}
+function clearSharedResVolatileMaps() {
 	bootManifestCache.clear();
 	cjsBootResolvedCache.clear();
 	dirEntriesCache.clear();
@@ -591,6 +619,13 @@ function clearAllBootVolatileCaches() {
 	anchorPathsCache.clear();
 	canonicalCache.clear();
 	prefixesCache.clear();
+	peerNamesCache.clear();
+	clearNonAsarRealDirCache();
+}
+function clearAllBootVolatileCaches() {
+	bootDirCache.clear();
+	bootExactStatCache.clear();
+	clearSharedResVolatileMaps();
 }
 function buildVerifiedDirState(dir, realNativeDir) {
 	let ents;
@@ -1070,45 +1105,37 @@ function endBootFsPhase() {
 globalThis[BOOT_FS_PHASE_SYMBOL] = { enter: installBootFsAccel, exit: endBootFsPhase };
 
 function clearResolutionCaches() {
-	canonicalCache.clear();
-	prefixesCache.clear();
-	selfRefDirCache.clear();
-	dirEntriesCache.clear();
-	peerNamesCache.clear();
-	anchorPathsCache.clear();
-	pkgDirAnchorCache.clear();
 	profileDirSnapshotCache.clear();
 	cjsAsarResolvedCache.clear();
-	cjsBootResolvedCache.clear();
-	bootManifestCache.clear();
-	for (const k of realDirCache.keys()) {
-		if (!isAsarImmutablePath(k)) realDirCache.delete(k);
-	}
+	clearSharedResVolatileMaps();
 }
 function canonicalPath(path) {
-	let cached = canonicalCache.get(path);
+	const useCache = canUseMutablePathCache(path);
+	let cached = useCache ? canonicalCache.get(path) : void 0;
 	if (cached !== void 0) return cached;
 	try {
 		cached = realpathSync(path);
 	} catch {
 		cached = resolve(path);
 	}
-	canonicalCache.set(path, cached);
+	if (useCache) canonicalCache.set(path, cached);
 	return cached;
 }
 function prefixes(path) {
-	let cached = prefixesCache.get(path);
+	const useCache = canUseMutablePathCache(path);
+	let cached = useCache ? prefixesCache.get(path) : void 0;
 	if (cached !== void 0) return cached;
 	const configured = resolve(path) + sep;
 	const canonical = canonicalPath(path) + sep;
 	cached = canonical === configured ? [configured] : [configured, canonical];
-	prefixesCache.set(path, cached);
+	if (useCache) prefixesCache.set(path, cached);
 	return cached;
 }
 function getDirEntries(dir) {
 	const normDir = IS_WIN32 && typeof dir === "string" ? stripWinNsPrefix(dir) : dir;
 	const normKey = IS_WIN32 && typeof normDir === "string" ? normDir.toLowerCase() : normDir;
-	let cached = dirEntriesCache.get(normKey);
+	const useCache = canUseMutablePathCache(normDir);
+	let cached = useCache ? dirEntriesCache.get(normKey) : void 0;
 	if (cached !== void 0) return cached;
 	if (bootPhaseActive && typeof normDir === "string" && !isAsarImmutablePath(normDir) && (isSimpleWinPath(normDir) || isDriveRootWin(normDir))) {
 		const dState = getVerifiedBootDir(normDir);
@@ -1132,7 +1159,7 @@ function getDirEntries(dir) {
 	} catch {
 		cached = null;
 	}
-	dirEntriesCache.set(normKey, cached);
+	if (useCache) dirEntriesCache.set(normKey, cached);
 	return cached;
 }
 function compileResolution(resolution) {
@@ -1170,7 +1197,8 @@ function compileResolution(resolution) {
 	}
 }`,
 `function readPeerNames(directory) {
-	let cached = peerNamesCache.get(directory);
+	const useCache = canUseMutablePathCache(directory);
+	let cached = useCache ? peerNamesCache.get(directory) : void 0;
 	if (cached !== void 0) return cached;
 	try {
 		const manifest = readPackageManifest(join(directory, "package.json"));
@@ -1179,7 +1207,7 @@ function compileResolution(resolution) {
 	} catch (_error) {
 		cached = /* @__PURE__ */ new Set();
 	}
-	peerNamesCache.set(directory, cached);
+	if (useCache) peerNamesCache.set(directory, cached);
 	return cached;
 }`,
     "dsh-app-boot readPeerNames"
@@ -1251,18 +1279,28 @@ function selfReferenceName(parent) {
 	return void 0;
 }
 function selfReferenceNameFromDir(startDir) {
-	const cached = selfRefDirCache.get(startDir);
-	if (cached !== void 0) return cached;
+	const useStartCache = canUseMutablePathCache(startDir);
+	if (useStartCache) {
+		const cached = selfRefDirCache.get(startDir);
+		if (cached !== void 0) return cached;
+	}
 	const visited = [];
+	let canWriteVisited = useStartCache;
 	let current = startDir;
 	let result = false;
 	while (true) {
-		const existing = selfRefDirCache.get(current);
-		if (existing !== void 0) {
-			result = existing;
-			break;
+		const useCurrCache = canUseMutablePathCache(current);
+		if (useCurrCache) {
+			const existing = selfRefDirCache.get(current);
+			if (existing !== void 0) {
+				result = existing;
+				break;
+			}
+		} else {
+			canWriteVisited = false;
+			visited.length = 0;
 		}
-		visited.push(current);
+		if (canWriteVisited) visited.push(current);
 		const dirEntries = getDirEntries(current);
 		const pkgEnt = dirEntries?.get("package.json");
 		const hasPkgJson = pkgEnt !== void 0 && (!pkgEnt.isSymbolicLink() || existsSync(join(current, "package.json")));
@@ -1287,7 +1325,9 @@ function selfReferenceNameFromDir(startDir) {
 		}
 		current = next;
 	}
-	for (let i = 0; i < visited.length; i++) selfRefDirCache.set(visited[i], result);
+	if (canWriteVisited) {
+		for (let i = 0; i < visited.length; i++) selfRefDirCache.set(visited[i], result);
+	}
 	return result;
 }
 function selfReferenceName(parent) {
@@ -1943,6 +1983,13 @@ if (import.meta.main)`,
 
   code = replaceOnce(
     code,
+`import { realpath, stat } from "node:fs/promises";`,
+`import { mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";`,
+    "dsh-hmr fs promises clock import"
+  );
+
+  code = replaceOnce(
+    code,
 `function requireInternal(id) {
 	const require = createRequire(import.meta.url);
 	if (process.execArgv.includes("--expose-internals")) try {
@@ -1962,6 +2009,20 @@ if (import.meta.main)`,
 	} catch (_error) {}
 }`,
     "dsh-hmr requireInternal direct try"
+  );
+
+  code = replaceOnce(
+    code,
+`	invalidate(manifest) {
+		const native = this.installPackageHooks();
+		const directory = dirname(manifest);
+		this.directories.add(directory);`,
+`	invalidate(manifest) {
+		const native = this.installPackageHooks();
+		const directory = dirname(manifest);
+		invalidateRealSpellings(directory);
+		this.directories.add(directory);`,
+    "dsh-hmr PackageManifests invalidate realSpellings"
   );
 
   code = replaceOnce(
@@ -1995,8 +2056,61 @@ if (import.meta.main)`,
 `	records = /* @__PURE__ */ new Map();
 	observedAt = Date.now();
 	__clockOffsetMs;
+	__calibrationPromise;
+	__observeEpoch = 0;
+	__uncalibratedObservedAt;
+	__applyClockOffsetToPending() {
+		if (this.__clockOffsetMs !== void 0 && this.__uncalibratedObservedAt !== void 0) {
+			this.observedAt = this.__uncalibratedObservedAt + this.__clockOffsetMs;
+			this.__uncalibratedObservedAt = void 0;
+		}
+	}
 	markObservedNow() {
-		this.observedAt = Date.now();
+		const epoch = ++this.__observeEpoch;
+		const baseSysNow = Date.now();
+		if (this.__clockOffsetMs !== void 0) {
+			this.__uncalibratedObservedAt = void 0;
+			this.observedAt = baseSysNow + this.__clockOffsetMs;
+			return Promise.resolve(this.observedAt);
+		}
+		this.__uncalibratedObservedAt = baseSysNow;
+		this.observedAt = baseSysNow;
+		return this.__calibrateClockAsync().then((offset) => {
+			if (offset !== void 0 && this.__observeEpoch === epoch) this.__applyClockOffsetToPending();
+			return this.observedAt;
+		});
+	}
+	__calibrateClockAsync() {
+		if (this.__clockOffsetMs !== void 0) return Promise.resolve(this.__clockOffsetMs);
+		if (this.__calibrationPromise !== void 0) return this.__calibrationPromise;
+		const job = (async () => {
+			let directory;
+			try {
+				directory = await mkdtemp(join(tmpdir(), "dsh-hmr-clock-"));
+			} catch (_error) {
+				return;
+			}
+			try {
+				const marker = join(directory, "now");
+				const sysBefore = Date.now();
+				await writeFile(marker, "");
+				const sysAfter = Date.now();
+				const fsNow = (await stat(marker)).mtimeMs;
+				const offset = fsNow - (sysBefore + sysAfter) / 2;
+				if (this.__clockOffsetMs === void 0) this.__clockOffsetMs = offset;
+				return this.__clockOffsetMs;
+			} catch (_error) {
+				return;
+			} finally {
+				await rm(directory, {
+					recursive: true,
+					force: true
+				}).catch(() => {});
+				if (this.__calibrationPromise === job) this.__calibrationPromise = void 0;
+			}
+		})();
+		this.__calibrationPromise = job;
+		return job;
 	}
 	now() {
 		if (this.__clockOffsetMs !== void 0) return Date.now() + this.__clockOffsetMs;
@@ -2012,6 +2126,7 @@ if (import.meta.main)`,
 			writeFileSync(marker, "");
 			const fsNow = statSync(marker).mtimeMs;
 			this.__clockOffsetMs = fsNow - sysNow;
+			this.__applyClockOffsetToPending();
 			return fsNow;
 		} finally {
 			rmSync(directory, {
@@ -2020,7 +2135,34 @@ if (import.meta.main)`,
 			});
 		}
 	}`,
-    "dsh-hmr ModuleFiles clock offset cache"
+    "dsh-hmr ModuleFiles clock offset cache & async calibration"
+  );
+
+  code = replaceOnce(
+    code,
+`	compare(urls) {
+		const stale = /* @__PURE__ */ new Set();`,
+`	compare(urls) {
+		this.__applyClockOffsetToPending();
+		const stale = /* @__PURE__ */ new Set();`,
+    "dsh-hmr ModuleFiles compare flush pending calibration"
+  );
+
+  code = replaceOnce(
+    code,
+`		this.records = records;
+		this.observedAt = at;
+	}
+	/**
+	* Record the current identity of modules just evaluated again, leaving every other record unchanged.`,
+`		this.__observeEpoch += 1;
+		this.__uncalibratedObservedAt = void 0;
+		this.records = records;
+		this.observedAt = at;
+	}
+	/**
+	* Record the current identity of modules just evaluated again, leaving every other record unchanged.`,
+    "dsh-hmr ModuleFiles observe bump epoch"
   );
 
   code = replaceOnce(
@@ -2067,6 +2209,31 @@ if (import.meta.main)`,
 				const started = Promise.withResolvers();
 				this.applicationReady = started.promise;
 				let idleObserveTimer;
+				let observeCalibration;
+				let disposed = false;
+				const startIdleStepObserve = () => {
+					if (disposed || this.closing || this.files.records.size > 0) return;
+					try {
+						const observeEpoch = this.files.__observeEpoch;
+						const at = this.files.observedAt;
+						const urls = this.profileModules(profileRoots(profile.dir));
+						let idx = 0;
+						const stepObserve = () => {
+							if (disposed || this.closing || this.files.__observeEpoch !== observeEpoch) return;
+							const end = Math.min(idx + 80, urls.length);
+							for (; idx < end; idx++) {
+								const u = urls[idx];
+								if (this.files.records.has(u)) continue;
+								const id = identityOf(u);
+								this.files.records.set(u, id === void 0 || id.modifiedAt > at ? void 0 : id.key);
+							}
+							if (idx < urls.length) setImmediate(stepObserve);
+						};
+						setImmediate(stepObserve);
+					} catch (error) {
+						this.ctx.logger.warn(error);
+					}
+				};
 				const unsubscribe = ready.onReady(() => {
 					if (process.env.DSH_HMR_EAGER_OBSERVE === "1") {
 						try {
@@ -2077,34 +2244,23 @@ if (import.meta.main)`,
 						started.resolve(true);
 						return;
 					}
-					this.files.markObservedNow();
+					observeCalibration = this.files.markObservedNow();
 					started.resolve(true);
 					idleObserveTimer = setTimeout(() => {
 						idleObserveTimer = void 0;
-						if (this.closing || this.files.records.size > 0) return;
-						try {
-							const at = this.files.observedAt;
-							const urls = this.profileModules(profileRoots(profile.dir));
-							let idx = 0;
-							const stepObserve = () => {
-								if (this.closing) return;
-								const end = Math.min(idx + 80, urls.length);
-								for (; idx < end; idx++) {
-									const u = urls[idx];
-									if (this.files.records.has(u)) continue;
-									const id = identityOf(u);
-									this.files.records.set(u, id === void 0 || id.modifiedAt > at ? void 0 : id.key);
-								}
-								if (idx < urls.length) setImmediate(stepObserve);
-							};
-							setImmediate(stepObserve);
-						} catch (error) {
-							this.ctx.logger.warn(error);
+						if (disposed || this.closing || this.files.records.size > 0) return;
+						if (this.files.__calibrationPromise !== void 0 && observeCalibration !== void 0) {
+							void observeCalibration.then(() => {
+								startIdleStepObserve();
+							}, () => {});
+							return;
 						}
+						startIdleStepObserve();
 					}, 1500);
 					idleObserveTimer.unref();
 				});
 				yield () => {
+					disposed = true;
 					if (idleObserveTimer !== void 0) {
 						clearTimeout(idleObserveTimer);
 						idleObserveTimer = void 0;
@@ -2136,22 +2292,98 @@ if (import.meta.main)`,
 
   code = replaceOnce(
     code,
-`function realSpellings(path) {
+`function mappedDirectories(resolution) {
+	const directories = /* @__PURE__ */ new Set();
+	if (resolution === void 0) return directories;
+	const dirs = [...resolution.entries.filter((entry) => entry.scope === "profile").map((entry) => entry.packageDir), ...resolution.linkedRoots.map((root) => root.realPath)];
+	for (const dir of dirs) for (const spelling of existsSync(dir) ? realSpellings(dir) : [dir]) directories.add(spelling + sep);
+	return directories;
+}
+/**
+* The JavaScript and native real paths of an existing path. A packed worker's file system has no native realpath.
+* @param path Existing path.
+* @returns The distinct spellings.
+*/
+function realSpellings(path) {
 	const native = Reflect.get(realpathSync, "native");
 	return [realpathSync(path), ...typeof native === "function" ? [String(Reflect.apply(native, realpathSync, [path]))] : []];
+}
+/**
+* Real directories, with a trailing separator, of the profile and of the targets its linked packages point to. Each
+* appears in both real-path spellings: Node's module caches use the JavaScript one, the runtime resolution the native
+* one, and on Windows they differ for 8.3 short names.
+*/
+function profileRoots(dir) {
+	const modules = join(realpathSync(dir), "node_modules");
+	const linked = (existsSync(modules) ? readdirSync(modules) : []).flatMap((name) => name.startsWith("@") ? readdirSync(join(modules, name)).map((child) => join(modules, name, child)) : [join(modules, name)]).filter((path) => lstatSync(path).isSymbolicLink() && existsSync(path));
+	return [...new Set([dir, ...linked].flatMap((path) => realSpellings(path)).map((root) => root + sep))];
 }`,
 `const realSpellingsCache = /* @__PURE__ */ new Map();
+let realSpellingsScopeDepth = 0;
+const normalizePathForMatch = process.platform === "win32" ? (p) => p.toLowerCase() : (p) => p;
+function isAsarImmutableHmrPath(p) {
+	return typeof p === "string" && (p.includes(".asar\\\\") || p.includes(".asar/") || p.endsWith(".asar")) && !p.includes(".asar.unpacked\\\\") && !p.includes(".asar.unpacked/");
+}
+function isPathRelated(candidate, normTarget, targetPrefix) {
+	const normCandidate = normalizePathForMatch(candidate);
+	const candidatePrefix = normCandidate.endsWith(sep) ? normCandidate : normCandidate + sep;
+	return normCandidate === normTarget || normCandidate.startsWith(targetPrefix) || targetPrefix.startsWith(candidatePrefix);
+}
+function invalidateRealSpellings(targetPath) {
+	if (targetPath === void 0) {
+		for (const key of realSpellingsCache.keys()) {
+			if (!isAsarImmutableHmrPath(key)) realSpellingsCache.delete(key);
+		}
+		return;
+	}
+	const normTarget = normalizePathForMatch(targetPath);
+	const targetPrefix = normTarget.endsWith(sep) ? normTarget : normTarget + sep;
+	for (const [key, cached] of realSpellingsCache) {
+		if (isAsarImmutableHmrPath(key)) continue;
+		if (isPathRelated(key, normTarget, targetPrefix) || cached.some((s) => isPathRelated(s, normTarget, targetPrefix))) {
+			realSpellingsCache.delete(key);
+		}
+	}
+}
+function withRealSpellingsScope(fn) {
+	realSpellingsScopeDepth += 1;
+	try {
+		return fn();
+	} finally {
+		realSpellingsScopeDepth -= 1;
+		if (realSpellingsScopeDepth === 0) invalidateRealSpellings();
+	}
+}
+function mappedDirectories(resolution) {
+	const directories = /* @__PURE__ */ new Set();
+	if (resolution === void 0) return directories;
+	return withRealSpellingsScope(() => {
+		const dirs = [...resolution.entries.filter((entry) => entry.scope === "profile").map((entry) => entry.packageDir), ...resolution.linkedRoots.map((root) => root.realPath)];
+		for (const dir of dirs) for (const spelling of existsSync(dir) ? realSpellings(dir) : [dir]) directories.add(spelling + sep);
+		return directories;
+	});
+}
 function realSpellings(path) {
-	let cached = realSpellingsCache.get(path);
-	if (cached !== void 0) return cached;
+	const useCache = realSpellingsScopeDepth > 0 || isAsarImmutableHmrPath(path);
+	if (useCache) {
+		const cached = realSpellingsCache.get(path);
+		if (cached !== void 0) return cached;
+	}
 	const native = Reflect.get(realpathSync, "native");
 	const jsReal = realpathSync(path);
 	const natReal = typeof native === "function" ? String(Reflect.apply(native, realpathSync, [path])) : void 0;
-	cached = natReal !== void 0 && natReal !== jsReal ? [jsReal, natReal] : [jsReal];
-	realSpellingsCache.set(path, cached);
-	return cached;
+	const spellings = natReal !== void 0 && natReal !== jsReal ? [jsReal, natReal] : [jsReal];
+	if (useCache) realSpellingsCache.set(path, spellings);
+	return spellings;
+}
+function profileRoots(dir) {
+	return withRealSpellingsScope(() => {
+		const modules = join(realpathSync(dir), "node_modules");
+		const linked = (existsSync(modules) ? readdirSync(modules) : []).flatMap((name) => name.startsWith("@") ? readdirSync(join(modules, name)).map((child) => join(modules, name, child)) : [join(modules, name)]).filter((path) => lstatSync(path).isSymbolicLink() && existsSync(path));
+		return [...new Set([dir, ...linked].flatMap((path) => realSpellings(path)).map((root) => root + sep))];
+	});
 }`,
-    "dsh-hmr realSpellings cache"
+    "dsh-hmr realSpellings scoped cache & invalidation"
   );
 
   replacements.set(path, Buffer.from(code, "utf8"));
@@ -3388,8 +3620,8 @@ async function createRuntimeResolution(options) {
 		}
 	}
 	const prevWatcher = _activeResWatcher;
-	const recorder = { seen: new Set(), list: [] };
-	_activeResWatcher = recorder;
+	const recorder = bypassSnapshot ? null : { seen: new Set(), list: [], pkgKeys: new Set() };
+	if (!bypassSnapshot) _activeResWatcher = recorder;
 	const captureSeq = resWriteSeq;
 	let table;
 	try {
@@ -3438,7 +3670,7 @@ async function createRuntimeResolution(options) {
 	} finally {
 		_activeResWatcher = prevWatcher;
 	}
-	if (!isBootFastOptDisabled() && process.env.DSH_NO_RES_CACHE !== "1") {
+	if (!bypassSnapshot && !isBootFastOptDisabled() && process.env.DSH_NO_RES_CACHE !== "1") {
 		try {
 			const ast = anchorAsarPath !== null ? statAsarReal(anchorAsarPath) : statSync(installAnchor);
 			scheduleWriteResSnapshot(snapPath, {
@@ -3514,7 +3746,12 @@ async function createRuntimeResolution(options) {
     code,
 `	if (ent === void 0) return false;
 	const candidate = join(searchPath, packageName);
-	if (ent.isSymbolicLink()) return existsSync(join(candidate, "package.json"));`,
+	if (ent.isSymbolicLink()) return existsSync(join(candidate, "package.json"));
+	if (!ent.isDirectory()) return false;
+	const pkgEntries = getDirEntries(candidate);
+	if (pkgEntries === null) return false;
+	const pkgEnt = pkgEntries.get("package.json");
+	return pkgEnt !== void 0 && (!pkgEnt.isSymbolicLink() || existsSync(join(candidate, "package.json")));`,
 `	const candidate = join(searchPath, packageName);
 	if (ent === void 0) {
 		recordResWatcherDir(candidate);
@@ -3524,8 +3761,68 @@ async function createRuntimeResolution(options) {
 		const pj = join(candidate, "package.json");
 		recordResWatcherFile(pj);
 		return existsSync(pj);
-	}`,
+	}
+	if (!ent.isDirectory()) return false;
+	const pkgEntries = getDirEntries(candidate);
+	if (pkgEntries === null) return false;
+	const pkgEnt = pkgEntries.get("package.json");
+	const pj = join(candidate, "package.json");
+	recordResWatcherFile(pj);
+	return pkgEnt !== void 0 && (!pkgEnt.isSymbolicLink() || existsSync(pj));`,
     "dsh-app-boot hasPackageManifestInSearchPath pkg watcher"
+  );
+
+  code = replaceOnce(
+    code,
+`function packageDirFromAnchor(anchor, packageName) {
+	if (isBuiltin(packageName)) return void 0;
+	const useCache = bootPhaseActive;
+	const cacheKey = useCache ? dirname(anchor) + "\\0" + packageName : "";
+	if (useCache && pkgDirAnchorCache.has(cacheKey)) return pkgDirAnchorCache.get(cacheKey);
+	let result;
+	for (const searchPath of getAnchorSearchPaths(anchor)) {
+		if (hasPackageManifestInSearchPath(searchPath, packageName)) {
+			result = join(searchPath, packageName);
+			break;
+		}
+	}
+	if (useCache) pkgDirAnchorCache.set(cacheKey, result);
+	return result;
+}`,
+`function packageDirFromAnchor(anchor, packageName) {
+	if (isBuiltin(packageName)) return void 0;
+	const useCache = bootPhaseActive;
+	const cacheKey = useCache ? dirname(anchor) + "\\0" + packageName : "";
+	if (useCache && (_activeResWatcher === null || _activeResWatcher.pkgKeys.has(cacheKey)) && pkgDirAnchorCache.has(cacheKey)) return pkgDirAnchorCache.get(cacheKey);
+	let result;
+	for (const searchPath of getAnchorSearchPaths(anchor)) {
+		if (hasPackageManifestInSearchPath(searchPath, packageName)) {
+			result = join(searchPath, packageName);
+			break;
+		}
+	}
+	if (useCache) {
+		pkgDirAnchorCache.set(cacheKey, result);
+		if (_activeResWatcher !== null) _activeResWatcher.pkgKeys.add(cacheKey);
+	}
+	return result;
+}`,
+    "dsh-app-boot packageDirFromAnchor res watcher hook"
+  );
+
+  code = replaceOnce(
+    code,
+`		} else {
+			if (!entries.has(IS_WIN32 ? name.toLowerCase() : name)) return false;
+		}
+		return existsSync(join(nmDir, name, "package.json"));`,
+`		} else {
+			if (!entries.has(IS_WIN32 ? name.toLowerCase() : name)) return false;
+		}
+		const pj = join(nmDir, name, "package.json");
+		recordResWatcherFile(pj);
+		return existsSync(pj);`,
+    "dsh-app-boot installedProfilePackageNames pkg watcher"
   );
 
   code = replaceOnce(
@@ -4514,27 +4811,13 @@ let _bootFsRestorers = [];`,
 `function clearAllBootVolatileCaches() {
 	bootDirCache.clear();
 	bootExactStatCache.clear();
-	bootManifestCache.clear();
-	cjsBootResolvedCache.clear();
-	dirEntriesCache.clear();
-	selfRefDirCache.clear();
-	pkgDirAnchorCache.clear();
-	anchorPathsCache.clear();
-	canonicalCache.clear();
-	prefixesCache.clear();
+	clearSharedResVolatileMaps();
 }`,
 `function clearAllBootVolatileCaches() {
 	bootDirCache.clear();
 	bootExactStatCache.clear();
-	bootManifestCache.clear();
-	cjsBootResolvedCache.clear();
 	bootEsmRelDirCache.clear();
-	dirEntriesCache.clear();
-	selfRefDirCache.clear();
-	pkgDirAnchorCache.clear();
-	anchorPathsCache.clear();
-	canonicalCache.clear();
-	prefixesCache.clear();
+	clearSharedResVolatileMaps();
 }`,
     "dsh-app-boot clearAllBootVolatileCaches clear bootEsmRelDirCache"
   );
