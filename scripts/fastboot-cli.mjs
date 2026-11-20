@@ -10,6 +10,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
   writeSync
@@ -209,6 +210,129 @@ function resolveInstallTarget(explicitDir) {
   return found[0];
 }
 
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {}
+  }
+}
+
+function replaceFileSafely(srcTmpPath, dstPath, rollbackBackupPath) {
+  const retryDelays = [80, 160, 240, 320, 400];
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+    try {
+      // Windows 下 libuv renameSync 底层使用 MoveFileExW(MOVEFILE_REPLACE_EXISTING)，无需先 unlinkSync
+      renameSync(srcTmpPath, dstPath);
+      return;
+    } catch (err) {
+      lastErr = err;
+      const code = err && typeof err === "object" ? err.code : "";
+      const retryable = code === "EPERM" || code === "EBUSY" || code === "EACCES";
+      if (!retryable || attempt === retryDelays.length) break;
+      sleepSync(retryDelays[attempt]);
+    }
+  }
+  if (!existsSync(dstPath) && rollbackBackupPath && existsSync(rollbackBackupPath)) {
+    try {
+      copyFileSync(rollbackBackupPath, dstPath);
+    } catch {}
+  }
+  throw lastErr;
+}
+
+function verifyUnpackedConsistency(parsed, targetDir, label) {
+  const unpackedEntries = parsed.fileEntries.filter(
+    (e) => e.node.unpacked && e.node.link === void 0
+  );
+  if (unpackedEntries.length === 0) {
+    return { checked: 0, hashVerified: 0 };
+  }
+  const unpackedRoot = join(targetDir, "resources", "app.asar.unpacked");
+  if (!existsSync(unpackedRoot)) {
+    throw new Error(
+      `[${label}] 声明了 ${unpackedEntries.length} 个解包文件，但未找到解包目录 ${unpackedRoot}，疑似版本错配。`
+    );
+  }
+  let missingCount = 0;
+  let mismatchCount = 0;
+  let hashVerified = 0;
+  const missingSamples = [];
+  const mismatchSamples = [];
+
+  for (const entry of unpackedEntries) {
+    const diskPath = join(unpackedRoot, ...entry.path.split("/"));
+    if (!existsSync(diskPath)) {
+      missingCount++;
+      if (missingSamples.length < 8) missingSamples.push(entry.path);
+      continue;
+    }
+    if (entry.node.integrity?.algorithm === "SHA256" && typeof entry.node.integrity?.hash === "string") {
+      const actualHash = createHash("sha256").update(readFileSync(diskPath)).digest("hex");
+      if (actualHash !== entry.node.integrity.hash) {
+        mismatchCount++;
+        if (mismatchSamples.length < 8) mismatchSamples.push(entry.path);
+      } else {
+        hashVerified++;
+      }
+    } else if (typeof entry.node.size === "number") {
+      const st = statSync(diskPath);
+      if (st.size !== entry.node.size) {
+        mismatchCount++;
+        if (mismatchSamples.length < 8) mismatchSamples.push(entry.path);
+      }
+    }
+  }
+
+  if (missingCount > 0 || mismatchCount > 0) {
+    const details = [];
+    if (missingCount > 0) {
+      details.push(`缺失 ${missingCount} 个文件 (示例: ${missingSamples.join(", ")})`);
+    }
+    if (mismatchCount > 0) {
+      details.push(`哈希/大小不一致 ${mismatchCount} 个文件 (示例: ${mismatchSamples.join(", ")})`);
+    }
+    throw new Error(
+      `[${label}] 与磁盘 app.asar.unpacked 不一致，已中止以防跨版本错配崩溃：${details.join("；")}。请先使用官方安装包修复或核对备份版本。`
+    );
+  }
+  return { checked: unpackedEntries.length, hashVerified };
+}
+
+function getAncestorPids() {
+  const ancestors = new Set([process.pid]);
+  if (typeof process.ppid === "number" && process.ppid > 0) ancestors.add(process.ppid);
+  if (process.platform !== "win32") return ancestors;
+  const ps = `
+$ErrorActionPreference = 'SilentlyContinue'
+$map = @{}
+Get-CimInstance Win32_Process | ForEach-Object { $map[[int]$_.ProcessId] = [int]$_.ParentProcessId }
+$cur = ${process.pid}
+for ($i = 0; $i -lt 16; $i++) {
+  if (-not $map.ContainsKey($cur)) { break }
+  $p = $map[$cur]
+  if ($p -le 0 -or $p -eq $cur) { break }
+  Write-Output $p
+  $cur = $p
+}
+`;
+  try {
+    const res = spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], {
+      encoding: "utf8",
+      windowsHide: true
+    });
+    if (res.status === 0 && res.stdout) {
+      for (const line of res.stdout.split(/\r?\n/)) {
+        const pid = Number(line.trim());
+        if (Number.isInteger(pid) && pid > 0) ancestors.add(pid);
+      }
+    }
+  } catch {}
+  return ancestors;
+}
+
 function findRunningProcesses(targetRoot) {
   if (process.platform !== "win32") return [];
   const ps = `
@@ -225,7 +349,7 @@ Get-Process -Name 'DeepSeek Harness' | ForEach-Object {
   });
   if (res.status !== 0 || !res.stdout) return [];
   const exeNorm = join(targetRoot, "DeepSeek Harness.exe").toLowerCase();
-  const running = [];
+  const rawRunning = [];
   for (const line of res.stdout.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -234,12 +358,14 @@ Get-Process -Name 'DeepSeek Harness' | ForEach-Object {
     const pid = Number(trimmed.slice(0, sep));
     const exePath = trimmed.slice(sep + 1).trim();
     // 若通过 DeepSeek Harness.exe 以 ELECTRON_RUN_AS_NODE=1 运行本脚本自身，跳过自身与祖先检查以免误报占用
-    if (pid === process.pid) continue;
+    if (pid === process.pid || pid === process.ppid) continue;
     if (exePath.toLowerCase() === exeNorm) {
-      running.push({ pid, exePath });
+      rawRunning.push({ pid, exePath });
     }
   }
-  return running;
+  if (rawRunning.length === 0) return [];
+  const ancestors = getAncestorPids();
+  return rawRunning.filter((r) => !ancestors.has(r.pid));
 }
 
 function resolveDshCacheDir() {
@@ -307,6 +433,9 @@ function writeAndVerifyAsar(parsed, replacements, outPath, checkExePath) {
 
   // 全量回读新生成的 ASAR 核验每条哈希与长度
   const verified = parseAsar(outPath);
+  if (verified.fileEntries.length !== parsed.fileEntries.length) {
+    throw new Error(`ASAR 总条目数不匹配 (${verified.fileEntries.length} !== ${parsed.fileEntries.length})`);
+  }
   const packedVerified = verified.fileEntries.filter(
     (e) => !e.node.unpacked && e.node.link === void 0 && e.node.offset !== void 0
   );
@@ -440,6 +569,10 @@ function cmdInstall(flags) {
     baseInfo = bakInfo;
   }
 
+  const baseLabel = baseSourcePath === bakPath ? `原版备份 (${baseInfo.appVersion})` : `当前 app.asar (${baseInfo.appVersion})`;
+  const unpackedCheck = verifyUnpackedConsistency(baseInfo.parsed, targetDir, baseLabel);
+  console.log(`解包目录一致性校验通过 (${baseLabel}): 共核验 ${unpackedCheck.checked} 个条目 (SHA-256 匹配 ${unpackedCheck.hashVerified})。`);
+
   console.log("正在校验核心补丁锚点与生成加速模块...");
   const replacements = applyFastbootPatches({
     listPaths: () => baseInfo.parsed.fileEntries.map((e) => e.path),
@@ -479,8 +612,14 @@ function cmdInstall(flags) {
       } catch {}
       throw new Error(`创建原版备份失败，校验和不一致: ${bakPath}`);
     }
-    if (existsSync(bakPath)) unlinkSync(bakPath);
-    renameSync(bakTmp, bakPath);
+    try {
+      replaceFileSafely(bakTmp, bakPath, null);
+    } catch (bakErr) {
+      try {
+        rmSync(bakTmp, { force: true });
+      } catch {}
+      throw new Error(`保存原版备份失败: ${bakErr.message}`);
+    }
     console.log(`已保存官方原版备份: ${bakPath}`);
   }
 
@@ -495,16 +634,10 @@ function cmdInstall(flags) {
       return;
     }
 
-    // 原子替换上线；若中途删除后 rename 失败立即从 bakPath 恢复
+    // 原子替换上线；若失败则兜底从 bakPath 恢复
     try {
-      if (existsSync(asarPath)) unlinkSync(asarPath);
-      renameSync(tmpPath, asarPath);
+      replaceFileSafely(tmpPath, asarPath, bakPath);
     } catch (swapErr) {
-      if (!existsSync(asarPath) && existsSync(bakPath)) {
-        try {
-          copyFileSync(bakPath, asarPath);
-        } catch {}
-      }
       throw new Error(`替换 app.asar 失败 (请确认没有其他程序占用该文件): ${swapErr.message}`);
     }
   } catch (err) {
@@ -582,6 +715,9 @@ function cmdUninstall(flags) {
     );
   }
 
+  const unpackedCheck = verifyUnpackedConsistency(bakState.parsed, targetDir, `原版备份 (${bakState.appVersion})`);
+  console.log(`还原前解包目录一致性校验通过: 共核验 ${unpackedCheck.checked} 个条目 (SHA-256 匹配 ${unpackedCheck.hashVerified})。`);
+
   // 复制检验后再原子覆盖，确保原版文件完整无损
   const restoreTmp = `${asarPath}.restore.tmp`;
   copyFileSync(bakPath, restoreTmp);
@@ -592,8 +728,14 @@ function cmdUninstall(flags) {
     throw new Error("备份副本校验和不一致，还原已取消。");
   }
 
-  if (existsSync(asarPath)) unlinkSync(asarPath);
-  renameSync(restoreTmp, asarPath);
+  try {
+    replaceFileSafely(restoreTmp, asarPath, bakPath);
+  } catch (restoreErr) {
+    try {
+      rmSync(restoreTmp, { force: true });
+    } catch {}
+    throw new Error(`还原 app.asar 失败 (请确认没有其他程序占用该文件): ${restoreErr.message}`);
+  }
 
   if (!flags.keepCache) {
     const cleaned = cleanRuntimeCaches();
